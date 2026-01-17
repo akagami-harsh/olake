@@ -14,6 +14,7 @@ import (
 	"github.com/apache/spark-connect-go/v35/spark/sql/types"
 	"github.com/datazip-inc/olake/constants"
 	"github.com/datazip-inc/olake/utils"
+	"github.com/datazip-inc/olake/utils/logger"
 	"github.com/datazip-inc/olake/utils/typeutils"
 	"github.com/docker/docker/api/types/container"
 	"github.com/minio/minio-go/v7"
@@ -31,6 +32,7 @@ const (
 	installCmd          = "apt-get update && apt-get install -y openjdk-17-jre-headless maven default-mysql-client postgresql postgresql-client wget gnupg iproute2 dnsutils iputils-ping netcat-openbsd nodejs npm jq && wget -qO - https://www.mongodb.org/static/pgp/server-8.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg && echo 'deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/debian bookworm/mongodb-org/8.0 main' | tee /etc/apt/sources.list.d/mongodb-org-8.0.list && apt-get update && apt-get install -y mongodb-mongosh && npm install -g chalk-cli"
 	SyncTimeout         = 10 * time.Minute
 	BenchmarkThreshold  = 0.9
+	maxRPSHistorySize   = 5
 )
 
 type IntegrationTest struct {
@@ -54,10 +56,6 @@ type PerformanceTest struct {
 	ExecuteQuery    func(ctx context.Context, t *testing.T, streams []string, operation string, fileConfig bool)
 }
 
-type benchmarkStats struct {
-	Backfill float64
-	CDC      float64
-}
 type SyncSpeed struct {
 	Speed string `json:"Speed"`
 }
@@ -70,18 +68,103 @@ type TestConfig struct {
 	ParquetDestinationPath string
 	StatePath              string
 	StatsPath              string
+	BenchmarksPath         string
 	HostTestDataPath       string
 	HostCatalogPath        string
 	HostTestCatalogPath    string
 }
 
-// this benchmark is for performance test which runs on a github runner
-// for absolute benchmarks, please checkout olake docs: https://olake.io/docs/connectors/postgres/benchmarks
-var benchmarks = map[constants.DriverType]benchmarkStats{
-	constants.MySQL:    {Backfill: 15906.40, CDC: 15648.93},
-	constants.Postgres: {Backfill: 12000, CDC: 1500},
-	constants.Oracle:   {Backfill: 3500, CDC: 0},
-	constants.MongoDB:  {Backfill: 0, CDC: 0},
+// history stores the RPS values and the last updated time for a given mode.
+type history struct {
+	RPS       []float64 `json:"rps"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// benchmarkStore stores the benchmark RPS history for backfill and CDC modes.
+type benchmarkStore struct {
+	Backfill history `json:"backfill"`
+	CDC      history `json:"cdc"`
+	FilePath string  `json:"-"`
+}
+
+// initializes the benchmark store with the given path and loads the stored benchmarks data from the file.
+func loadBenchmarks(path string) (*benchmarkStore, error) {
+	store := &benchmarkStore{
+		Backfill: history{
+			RPS:       make([]float64, 0, maxRPSHistorySize),
+			UpdatedAt: time.Now().UTC(),
+		},
+		CDC: history{
+			RPS:       make([]float64, 0, maxRPSHistorySize),
+			UpdatedAt: time.Now().UTC(),
+		},
+		FilePath: path,
+	}
+	if err := store.load(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
+
+// load loads the stored benchmarks data from the file.
+func (s *benchmarkStore) load() error {
+	if err := utils.UnmarshalFile(s.FilePath, s, false); err != nil {
+		if _, statErr := os.Stat(s.FilePath); os.IsNotExist(statErr) {
+			// Missing file is acceptable, it will be created when the first RPS is recorded.
+			return nil
+		}
+		return fmt.Errorf("failed to load rps benchmarks from file %s: %s", s.FilePath, err)
+	}
+
+	return nil
+}
+
+// record records a new benchmark RPS value for the given driver and mode, and persists it to the file.
+func (s *benchmarkStore) record(
+	isBackfill bool,
+	rps float64,
+) error {
+	rpsValues := utils.Ternary(
+		isBackfill,
+		s.Backfill.RPS,
+		s.CDC.RPS,
+	).([]float64)
+
+	rpsValues = append(rpsValues, rps)
+
+	// Truncate history to maintain a rolling window of the last maxRPSHistorySize values.
+	if len(rpsValues) > maxRPSHistorySize {
+		rpsValues = rpsValues[1:]
+	}
+
+	if isBackfill {
+		s.Backfill.RPS = rpsValues
+		s.Backfill.UpdatedAt = time.Now().UTC()
+	} else {
+		s.CDC.RPS = rpsValues
+		s.CDC.UpdatedAt = time.Now().UTC()
+	}
+
+	return logger.FileLoggerWithPath(s, s.FilePath)
+}
+
+// stats returns the average RPS and count of past RPS values for the given driver and mode.
+// The count cannot exceed maxRPSHistorySize.
+func (s *benchmarkStore) stats(
+	isBackfill bool,
+) (averageRPS float64, observations int) {
+	rpsValues := utils.Ternary(
+		isBackfill,
+		s.Backfill.RPS,
+		s.CDC.RPS,
+	).([]float64)
+
+	if len(rpsValues) == 0 {
+		// No benchmarks recorded for this mode yet.
+		return 0, 0
+	}
+
+	return utils.Average(rpsValues), len(rpsValues)
 }
 
 // GetTestConfig returns the test config for the given driver
@@ -102,6 +185,7 @@ func GetTestConfig(driver string) *TestConfig {
 		HostTestDataPath:       fmt.Sprintf(hostTestDataPath, driver, ""),
 		HostTestCatalogPath:    fmt.Sprintf(hostTestDataPath, driver, "test_streams.json"),
 		HostCatalogPath:        fmt.Sprintf(hostTestDataPath, driver, "streams.json"),
+		BenchmarksPath:         fmt.Sprintf(hostTestDataPath, driver, "benchmarks.json"),
 		SourcePath:             fmt.Sprintf(containerTestDataPath, driver, "source.json"),
 		CatalogPath:            fmt.Sprintf(containerTestDataPath, driver, "streams.json"),
 		IcebergDestinationPath: fmt.Sprintf(containerTestDataPath, driver, "iceberg_destination.json"),
@@ -215,7 +299,7 @@ func DeleteParquetFiles(t *testing.T, parquetDB, tableName string) error {
 		Secure: false,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create MinIO client: %w", err)
+		return fmt.Errorf("failed to create MinIO client: %s", err)
 	}
 
 	ctx := context.Background()
@@ -229,7 +313,7 @@ func DeleteParquetFiles(t *testing.T, parquetDB, tableName string) error {
 
 	for object := range objectsCh {
 		if object.Err != nil {
-			return fmt.Errorf("error listing objects: %w", object.Err)
+			return fmt.Errorf("error listing objects: %s", object.Err)
 		}
 
 		if strings.HasSuffix(object.Key, ".parquet") {
@@ -238,7 +322,7 @@ func DeleteParquetFiles(t *testing.T, parquetDB, tableName string) error {
 
 			err := minioClient.RemoveObject(ctx, bucketName, object.Key, minio.RemoveObjectOptions{})
 			if err != nil {
-				return fmt.Errorf("failed to delete %s: %w", object.Key, err)
+				return fmt.Errorf("failed to delete %s: %s", object.Key, err)
 			}
 			deletedCount++
 		}
@@ -309,6 +393,108 @@ func (cfg *IntegrationTest) runSyncAndVerify(
 	}
 
 	return nil
+}
+
+// testKafkaSync tests Kafka-specific streaming sync behavior
+// Kafka uses Consumer Group-based streaming which is different from database sync modes
+func (cfg *IntegrationTest) testKafkaSync(t *testing.T) {
+	ctx := context.Background()
+	currentTestTable := "kafka_test_table_olake"
+
+	t.Run("Kafka Streaming Sync", func(t *testing.T) {
+		req := testcontainers.ContainerRequest{
+			Image: "golang:1.24.0",
+			HostConfigModifier: func(hc *container.HostConfig) {
+				hc.Binds = []string{
+					fmt.Sprintf("%s:/test-olake:rw", cfg.TestConfig.HostRootPath),
+					fmt.Sprintf("%s:/test-olake/drivers/%s/internal/testdata:rw", cfg.TestConfig.HostTestDataPath, cfg.TestConfig.Driver),
+				}
+				hc.ExtraHosts = append(hc.ExtraHosts, "host.docker.internal:host-gateway")
+				hc.NetworkMode = "host"
+			},
+			ConfigModifier: func(config *container.Config) {
+				config.WorkingDir = "/test-olake"
+			},
+			Env: map[string]string{
+				"TELEMETRY_DISABLED": "true",
+			},
+			LifecycleHooks: []testcontainers.ContainerLifecycleHooks{
+				{
+					PostReadies: []testcontainers.ContainerHook{
+						func(ctx context.Context, c testcontainers.Container) error {
+							if code, output, err := utils.ExecCommand(ctx, c, installCmd); err != nil || code != 0 {
+								return fmt.Errorf("failed to install dependencies:\n%s", string(output))
+							}
+							if code, output, err := utils.ExecCommand(ctx, c, "go mod download"); err != nil || code != 0 {
+								return fmt.Errorf("failed to download go modules:\n%s", string(output))
+							}
+
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "clean", false)
+							t.Log("Cleaned Kafka topic")
+
+							resetCmd := fmt.Sprintf("echo '{}' > %s", cfg.TestConfig.StatePath)
+							if code, output, err := utils.ExecCommand(ctx, c, resetCmd); err != nil || code != 0 {
+								return fmt.Errorf("failed to reset state: %s\n%s", err, output)
+							}
+
+							// Produce initial messages
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "add", false)
+							t.Log("Produced initial messages to Kafka topic")
+
+							// Small delay for messages to be available
+							time.Sleep(2 * time.Second)
+
+							// Run initial sync
+							t.Run("Initial_Sync", func(t *testing.T) {
+								syncCmd := syncCommand(*cfg.TestConfig, false, "iceberg", "--destination-database-prefix", "integration_kafka")
+								t.Logf("Running initial sync: %s", syncCmd)
+
+								code, output, err := utils.ExecCommand(ctx, c, syncCmd)
+								if err != nil || code != 0 {
+									t.Fatalf("Initial sync failed (%d): %s\n%s", code, err, output)
+								}
+								t.Log("Initial sync completed successfully")
+							})
+
+							// Produce additional messages
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "insert", false)
+							t.Log("Produced additional messages to Kafka topic")
+
+							time.Sleep(2 * time.Second)
+
+							// Run incremental sync (continues from last offset)
+							t.Run("Incremental_Sync", func(t *testing.T) {
+								syncCmd := syncCommand(*cfg.TestConfig, true, "iceberg", "--destination-database-prefix", "integration_kafka")
+								t.Logf("Running incremental sync: %s", syncCmd)
+
+								code, output, err := utils.ExecCommand(ctx, c, syncCmd)
+								if err != nil || code != 0 {
+									t.Fatalf("Incremental sync failed (%d): %s\n%s", code, err, output)
+								}
+								t.Log("Incremental sync completed successfully")
+							})
+
+							cfg.ExecuteQuery(ctx, t, []string{currentTestTable}, "drop", false)
+							t.Log("Kafka streaming sync test completed")
+							return nil
+						},
+					},
+				},
+			},
+			Cmd: []string{"tail", "-f", "/dev/null"},
+		}
+
+		kafkaContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: req,
+			Started:          true,
+		})
+		require.NoError(t, err, "Container startup failed")
+		defer func() {
+			if err := kafkaContainer.Terminate(ctx); err != nil {
+				t.Logf("warning: failed to terminate container: %v", err)
+			}
+		}()
+	})
 }
 
 // testIcebergFullLoadAndCDC tests Full load and CDC operations
@@ -396,7 +582,7 @@ func (cfg *IntegrationTest) testParquetFullLoadAndCDC(
 	t.Log("Starting Parquet Full load + CDC tests")
 
 	if err := cfg.resetTable(ctx, t, testTable); err != nil {
-		return fmt.Errorf("failed to reset table: %w", err)
+		return fmt.Errorf("failed to reset table: %s", err)
 	}
 
 	testCases := []syncTestCase{
@@ -476,7 +662,7 @@ func (cfg *IntegrationTest) testIcebergFullLoadAndIncremental(
 	t.Log("Starting Iceberg Full load + Incremental tests")
 
 	if err := cfg.resetTable(ctx, t, testTable); err != nil {
-		return fmt.Errorf("failed to reset table: %w", err)
+		return fmt.Errorf("failed to reset table: %s", err)
 	}
 
 	// Patch streams.json: set sync_mode = incremental, cursor_field = "id"
@@ -562,7 +748,7 @@ func (cfg *IntegrationTest) testParquetFullLoadAndIncremental(
 	t.Log("Starting Parquet Full load + Incremental tests")
 
 	if err := cfg.resetTable(ctx, t, testTable); err != nil {
-		return fmt.Errorf("failed to reset table: %w", err)
+		return fmt.Errorf("failed to reset table: %s", err)
 	}
 
 	// Patch streams.json: set sync_mode = incremental, cursor_field = "id"
@@ -720,6 +906,12 @@ func (cfg *IntegrationTest) TestIntegration(t *testing.T) {
 	})
 
 	t.Run("Sync", func(t *testing.T) {
+		// Use custom sync tests for streaming drivers like Kafka
+		if slices.Contains(constants.HasCustomSyncTests, constants.DriverType(cfg.TestConfig.Driver)) {
+			cfg.testKafkaSync(t)
+			return
+		}
+
 		req := testcontainers.ContainerRequest{
 			Image: "golang:1.24.0",
 			HostConfigModifier: func(hc *container.HostConfig) {
@@ -1058,26 +1250,44 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 	ctx := context.Background()
 
 	// checks if the current rps (from stats.json) is at least 90% of the benchmark rps
-	isRPSAboveBenchmark := func(config TestConfig, isBackfill bool) (bool, error) {
+	checkBenchmarkRPS := func(config TestConfig, isBackfill bool) (bool, float64, error) {
 		// get current RPS
 		var stats SyncSpeed
 		if err := utils.UnmarshalFile(filepath.Join(config.HostRootPath, fmt.Sprintf("drivers/%s/internal/testdata/%s", config.Driver, "stats.json")), &stats, false); err != nil {
-			return false, err
+			return false, 0, err
 		}
 		rps, err := typeutils.ReformatFloat64(strings.Split(stats.Speed, " ")[0])
 		if err != nil {
-			return false, fmt.Errorf("failed to get RPS from stats: %s", err)
+			return false, 0, fmt.Errorf("failed to get RPS from stats: %s", err)
 		}
 
-		// get benchmark RPS
-		benchmarkDriverStats := benchmarks[constants.DriverType(config.Driver)]
-		benchmarkRPS := utils.Ternary(isBackfill, benchmarkDriverStats.Backfill, benchmarkDriverStats.CDC).(float64)
-
-		t.Logf("CurrentRPS: %.2f, BenchmarkRPS: %.2f", rps, benchmarkRPS)
-		if rps < BenchmarkThreshold*benchmarkRPS {
-			return false, fmt.Errorf("❌ RPS is less than benchmark RPS")
+		// Get past benchmark RPS stats
+		benchmarks, err := loadBenchmarks(config.BenchmarksPath)
+		if err != nil {
+			return false, 0, err
 		}
-		return true, nil
+
+		averageRPS, observations := benchmarks.stats(isBackfill)
+
+		// No benchmarks exist yet for this driver/mode
+		// Skip validation to allow initial benchmarking.
+		if observations == 0 {
+			t.Logf("No benchmarks exist yet for %s %s mode, skipping validation", config.Driver, utils.Ternary(isBackfill, "backfill", "cdc").(string))
+			return true, rps, nil
+		}
+		t.Logf("currentRPS: %.2f, averageRPS: %.2f, observations: %d", rps, averageRPS, observations)
+		if rps < BenchmarkThreshold*averageRPS {
+			return false, rps, nil
+		}
+		return true, rps, nil
+	}
+
+	recordBenchmark := func(config TestConfig, isBackfill bool, rps float64) error {
+		benchmarks, err := loadBenchmarks(config.BenchmarksPath)
+		if err != nil {
+			return err
+		}
+		return benchmarks.record(isBackfill, rps)
 	}
 
 	syncWithTimeout := func(ctx context.Context, c testcontainers.Container, cmd string) ([]byte, error) {
@@ -1143,11 +1353,16 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 							}
 							t.Log("(backfill) sync completed")
 
-							checkRPS, err := isRPSAboveBenchmark(*cfg.TestConfig, true)
+							checkRPS, currentRPS, err := checkBenchmarkRPS(*cfg.TestConfig, true)
 							if err != nil {
 								return fmt.Errorf("failed to check RPS: %s", err)
 							}
+
 							require.True(t, checkRPS, fmt.Sprintf("%s backfill performance below benchmark", cfg.TestConfig.Driver))
+
+							if err := recordBenchmark(*cfg.TestConfig, true, currentRPS); err != nil {
+								return fmt.Errorf("failed to write RPS history: %s", err)
+							}
 							t.Logf("✅ SUCCESS: %s backfill", cfg.TestConfig.Driver)
 
 							if len(cfg.CDCStreams) > 0 {
@@ -1187,11 +1402,15 @@ func (cfg *PerformanceTest) TestPerformance(t *testing.T) {
 								}
 								t.Log("(cdc) sync completed")
 
-								checkRPS, err := isRPSAboveBenchmark(*cfg.TestConfig, false)
+								checkRPS, currentRPS, err := checkBenchmarkRPS(*cfg.TestConfig, false)
 								if err != nil {
 									return fmt.Errorf("failed to check RPS: %s", err)
 								}
 								require.True(t, checkRPS, fmt.Sprintf("%s CDC performance below benchmark", cfg.TestConfig.Driver))
+
+								if err := recordBenchmark(*cfg.TestConfig, false, currentRPS); err != nil {
+									return fmt.Errorf("failed to write RPS history: %s", err)
+								}
 								t.Logf("✅ SUCCESS: %s cdc", cfg.TestConfig.Driver)
 							}
 							return nil
